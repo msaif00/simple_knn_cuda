@@ -8,7 +8,7 @@
 #include <algorithm>
 
 //Method for updating best[3]
-static inline void updateKBest3(float dist2, float best[3]):
+static inline void updateKBest3(float dist2, float best[3])
 {
     for (int j=0; j < 3; j++) {
         if (dist2 < best[j]) {
