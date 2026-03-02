@@ -17,6 +17,9 @@
 #include <vector>
 #include <cmath>
 #include <cfloat>
+#include <algorithm>
+#include <cfloat>
+#include <cstdint>
 
 #include <cuda_runtime.h>
 
@@ -111,6 +114,41 @@ __global__ void knn3_mean_dist2_gpu(int n, const float3* points, float* outMeanD
     outMeanDist2[i] = (best[0] + best[1] + best[2]) / 3.0f;
 }
 
+__global__ void knn3_mean_dist2_morton_window_gpu(
+    int n,
+    const float3* points,
+    const uint32_t* sortedIndices,
+    float* outMeanDist2) {
+
+    int s = blockIdx.x *blockIdx.x + threadIdx.x;
+    if (s >= n) return;
+
+    const uint32_t i = sortedIndices[s]; //Original index
+    const float3 pi = points[i];
+
+    float best[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
+
+    const int start = max(0, s - WINDOW);
+    const int end = min(n-1, s + WINDOW);
+
+    for (int t=start; t<=end; t++) {
+        if (t==s) continue; //Do not compare the point to iteself
+
+        const uint32_t j = sortedIndices[t]; //Original index of candidate neighbor
+        const float3 pj = points[j];
+
+        const float dx = pi.x - pj.x;
+        const float dy = pi.y - pj.y;
+        const float dz = pi.z - pj.z;
+        const float dist2 = dx*dx +dy*dy+dz*dz;
+
+        updateKBest3(dist2, best);
+    }
+
+    outMeanDist2[i] = (best[0] + best[1] + best[2]) / 3.0f;
+
+}
+
 __global__ void hello_kernel() {
     int globalThread =  blockIdx.x + blockDim.x * threadIdx.x;
     printf("Hello from RTX 2080 GPU, thread %d in block %d at global %d!\n",
@@ -175,28 +213,31 @@ int main() {
     // return 0;
 
     //Testing known points
-    std::vector<float3> h_points = {
-        make_float3(0.0f, 0.0f, 0.0f),
-        make_float3(1.0f, 0.0f, 0.0f),
-        make_float3(0.0f, 1.0f, 0.0f),
-        make_float3(0.0f, 0.0f, 1.0f),
-        make_float3(1.0f, 1.0f, 0.0f),
-    };
+    // std::vector<float3> h_points = {
+    //     make_float3(0.0f, 0.0f, 0.0f),
+    //     make_float3(1.0f, 0.0f, 0.0f),
+    //     make_float3(0.0f, 1.0f, 0.0f),
+    //     make_float3(0.0f, 0.0f, 1.0f),
+    //     make_float3(1.0f, 1.0f, 1.0f),
+    // };
 
-    const int N = static_cast<int>(h_points.size());
-    // const int N = 256;
+    // const int N = static_cast<int>(h_points.size());
+    const int N = 256;
+    constexpr int WINDOW = 8;
     //1. Creating points on CPU
-    // std::vector<float3> h_points = make_random_points(N);
-    //CPU reference
+    std::vector<float3> h_points = make_random_points(N);
+    //2. CPU reference
     std::vector<float> h_ref = knn3_mean_dist2_cpu(h_points);
 
-    //2. Allocate GPU buffers
+    //3. Allocate GPU buffers
     float3* d_points = nullptr;
-    float* d_out = nullptr;
+    float* d_out_exact = nullptr;
+    float* d_out_window = nullptr;
     CUDA_CHECK(cudaMalloc(&d_points, N*sizeof(float3)));
-    CUDA_CHECK(cudaMalloc(&d_out, N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_out_exact, N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_out_window, N*sizeof(float)));
 
-    //3. Copy from CPU to GPU
+    //4. Copy from CPU to GPU
     CUDA_CHECK(cudaMemcpy(d_points, h_points.data(),
         N*sizeof(float3), cudaMemcpyHostToDevice));
 
@@ -212,30 +253,42 @@ int main() {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Creaate indices and sort them by Morton code
+    //6. Creaate indices and sort them by Morton code
     thrust::device_vector<uint32_t> d_indices(N);
     thrust::sequence(d_indices.begin(), d_indices.end());
     thrust::sort_by_key(d_codes.begin(),d_codes.end(), d_indices.begin());
 
     // As a check print the first few indices
-    std::vector<uint32_t> h_indices(10);
+    const int printCount= std::min(10, N);
+    std::vector<uint32_t> h_indices(printCount);
     CUDA_CHECK(cudaMemcpy(h_indices.data(),
         thrust::raw_pointer_cast(d_indices.data()),
-            10*sizeof(uint32_t),
+            printCount*sizeof(uint32_t),
             cudaMemcpyDeviceToHost));
 
     // std::printf("First 10 indices after Morton sort:\n");
     // for (int i=0; i<10; i++) std::printf("%d ", h_indices[i]);
 
-    //6. Run Brute=force KNN on GPU
-    knn3_mean_dist2_gpu<<<grid, block>>>(N, d_points, d_out);
+    //7. Run Brute=force KNN on GPU
+    knn3_mean_dist2_gpu<<<grid, block>>>(N, d_points, d_out_exact);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    //7. Copy from GPU to CPU and print
-    std::vector<float> h_gpu(N);
-    CUDA_CHECK(cudaMemcpy(h_gpu.data(), d_out, N*sizeof(float),
+    //7. Approx. Morton window KNN
+    knn3_mean_dist2_morton_window_gpu<WINDOW><<<grid,block>>>(
+        N, d_points,
+        thrust::raw_pointer_cast(d_indices.data()),
+        d_out_window);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    //8. Copy from GPU to CPU and print
+    std::vector<float> h_gpu_exact(N), h_gpu_window(N);
+    CUDA_CHECK(cudaMemcpy(h_gpu_exact.data(), d_out_exact, N*sizeof(float),
         cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_gpu_window.data(), d_out_window,
+            N*sizeof(float), cudaMemcpyDeviceToHost));
+
     // std::printf("points[0] = (%.3f, %.3f, %.3f)\n",
     //         h_points[0].x, h_points[0].y, h_points[0].z);
     //
@@ -244,31 +297,36 @@ int main() {
     //                 i, h_points[i].x, h_points[i].y, h_points[i].z, h_gpu[i]);
     // }
 
-    // 8. Compare CPU result to GPU
-    float maxAbsErr = 0.0f;
-    int maxIdx = -1;
-    for (int i =0; i<N; i++) {
-        float err = std::fabs(h_gpu[i] - h_ref[i]);
-        if (err > maxAbsErr) {
-            maxAbsErr = err;
-            maxIdx = i;
-        }
-    }
-    std::printf("KNN3 mean dist^2 comparison:\n");
-    std::printf("  N=%d\n", N);
-    std::printf("  maxAbsErr = %.9g at i=%d\n", maxAbsErr, maxIdx);
-    if (maxIdx >= 0) {
-        std::printf("  ref[%d]=%.9g  gpu[%d]=%.9g\n",
-                    maxIdx, h_ref[maxIdx], maxIdx, h_gpu[maxIdx]);
-    }
+    // 9. Compare CPU result to GPU
+    auto report = [&](const char* name, const std::vector<float>& got) {
 
-    // Print a few sample outputs (sanity)
-    // for (int i = 0; i < 5; i++) {
-    //     std::printf("  i=%d  ref=%.6f  gpu=%.6f\n", i, h_ref[i], h_gpu[i]);
-    // }
-    //9. Cleanup
+        float maxAbsErr = 0.0f;
+        int maxIdx = -1;
+        for (int i =0; i<N; i++) {
+            float err = std::fabs(got[i] - h_ref[i]);
+            if (err > maxAbsErr) {
+                maxAbsErr = err;
+                maxIdx = i;
+            }
+        }
+        std::printf("%s vs CPU ref:\n", name);
+        std::printf("  maxAbsErr = %.9g at i=%d\n", maxAbsErr, maxIdx);
+        if (maxIdx >= 0) {
+            std::printf("  ref[%d]=%.9g  got[%d]=%.9g\n",
+                        maxIdx, h_ref[maxIdx], maxIdx, got[maxIdx]);
+        }
+        for (int i = 0; i < 5; i++) {
+            std::printf("  i=%d  ref=%.6f  got=%.6f\n", i, h_ref[i], got[i]);
+        }
+    };
+
+    report("GPU exact brute-force", h_gpu_exact);
+    report("GPU Morton-window (±8 in sorted order)", h_gpu_window);
+
+    //10. Cleanup
     CUDA_CHECK(cudaFree(d_points));
-    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_out_window));
+    CUDA_CHECK(cudaFree(d_out_exact));
 
     return 0;
 }
