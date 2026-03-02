@@ -113,14 +113,14 @@ __global__ void knn3_mean_dist2_gpu(int n, const float3* points, float* outMeanD
 
     outMeanDist2[i] = (best[0] + best[1] + best[2]) / 3.0f;
 }
-
+template <int WINDOW>
 __global__ void knn3_mean_dist2_morton_window_gpu(
     int n,
     const float3* points,
     const uint32_t* sortedIndices,
     float* outMeanDist2) {
 
-    int s = blockIdx.x *blockIdx.x + threadIdx.x;
+    int s = blockIdx.x *blockDim.x + threadIdx.x;
     if (s >= n) return;
 
     const uint32_t i = sortedIndices[s]; //Original index
@@ -223,7 +223,7 @@ int main() {
 
     // const int N = static_cast<int>(h_points.size());
     const int N = 256;
-    constexpr int WINDOW = 8;
+    // constexpr int WINDOW = 8;
     //1. Creating points on CPU
     std::vector<float3> h_points = make_random_points(N);
     //2. CPU reference
@@ -275,7 +275,7 @@ int main() {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     //7. Approx. Morton window KNN
-    knn3_mean_dist2_morton_window_gpu<WINDOW><<<grid,block>>>(
+    knn3_mean_dist2_morton_window_gpu<8><<<grid,block>>>(
         N, d_points,
         thrust::raw_pointer_cast(d_indices.data()),
         d_out_window);
