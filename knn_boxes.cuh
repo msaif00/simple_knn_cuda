@@ -27,3 +27,28 @@ __device__ __host__ inline float distBoxPoint(const MinMax& box, const float3& p
     return dx*dx+dy*dy+dz*dz;
 }
 
+//Kernel 1: Compute the AABB of each box
+
+__global__ void boxMinMaxKernel(
+    int n,
+    const float3* __restrict__ points,
+    const uint32_t* __restrict__ sortedIndices,
+    MinMax* __restrict__ boxes) {
+
+    const int globalIdx = blockIdx.x * blockDim.x = threadIdx.x;
+
+    //Each thread loads one point
+    MinMax me;
+    if (globalIdx < n) {
+        float3 p = points[sortedIndices[globalIdx]];
+        me.minn = p;
+        me.maxx = p;
+    } else {
+        me.minn = make_float3( FLT_MAX, FLT_MAX, FLT_MAX);
+        me.maxx = make_float3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    }
+
+    //Shared memory for reduction
+    __shared__ MinMax smem[BOX_SIZE];
+
+}
