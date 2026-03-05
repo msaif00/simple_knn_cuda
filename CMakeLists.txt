@@ -4,14 +4,15 @@ project(simple_knn_cuda CXX CUDA)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
 
+set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+
 find_package(CUDAToolkit REQUIRED)
 
 add_executable(simple_knn_cuda
         main.cu
         knn_cpu.cpp
         knn_cpu.h
-        knn_cpu.h
-        knn_cpu.cpp)
+        knn_boxes.cuh)
 
 target_include_directories(simple_knn_cuda PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
