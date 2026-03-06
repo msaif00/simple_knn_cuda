@@ -16,7 +16,7 @@ struct MinMax {
 __device__ __host__ inline float distBoxPoint(const MinMax& box, const float3& p) {
     float dx = 0.0f, dy= 0.0f, dz=0.0f;
     if (p.x < box.minn.x) dx = box.minn.x - p.x;
-    else if (p.x > box.minn.x) dx=p.x - boxx.minn.x;
+    else if (p.x > box.minn.x) dx=p.x - box.minn.x;
 
     if (p.y < box.minn.y) dy = box.minn.y -  p.y;
     else if (p.y > box.maxx.y) dy = p.y - box.maxx.y;
@@ -34,7 +34,7 @@ __global__ void boxMinMaxKernel(
     const float3* __restrict__ points,
     const uint32_t* __restrict__ sortedIndices,
     MinMax* __restrict__ boxes) {
-    const int globalIdx = blockIdx.x * blockDim.x = threadIdx.x;
+    const int globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
 
     //Each thread loads one point
     MinMax me;
@@ -72,6 +72,92 @@ __global__ void boxMinMaxKernel(
         boxes[blockIdx.x] = me;
 }
 
+// Kernel 2: box-pruned exact KNN-3
+//
+// for each point, loop over all the boxes, skip boxes whose AABB distance
+// is already worse than the third best option in the best[] array. Otherwise
+// scan the box's points
+// Launch config: <<<(N+255)/256, 256>>> (one thread per point in sorted order.
+
+__global__ void knn3BoxPrunedKernl(
+    int n,
+    const float3* __restrict__ points,
+    const uint32_t* __restrict__ sortedIndices,
+    const MinMax* __restrict__ boxes,
+    int numBoxes,
+    float* __restrict__ outMeanDist2) {
+
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= n) return;
+
+    const uint32_t i = sortedIndices[s];
+    const float3 pi = points[i];
+
+    float best[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
+
+    //Pass 1: Check small local window first
+    {
+        const int lo = max(0, s - 8);
+        const int hi = min(n - 1, s + 8);
+        for (int t = lo; t <= hi; t++) {
+            if (t == s) continue;
+            const uint32_t j = sortedIndices[t];
+            const float3 pj = points[j];
+            const float dx = pi.x - pj.x;
+            const float dy = pi.y - pj.y;
+            const float dz = pi.z - pj.z;
+            float dist2 = dx*dx + dy*dy + dz*dz;
+            // Bubble-insert into best[3]
+            for (int k = 0; k < 3; k++) {
+                if (dist2 < best[k]) {
+                    float tmp = best[k];
+                    best[k] = dist2;
+                    dist2 = tmp;
+                }
+            }
+        }
+    }
+
+    //reject ->current worst of the 3-best
+    float reject = best[2];
+
+    //Reset for all full extract search
+
+    best[0] = FLT_MAX;
+    best[1] = FLT_MAX;
+    best[2] = FLT_MAX;
+
+    //Pass 2: scan all boxes
+    for (int b = 0; b < numBoxes; b++) {
+        // If the box's closest possible point is farther than our reject threshold,
+        // AND farther than our current 3rd-best, skip the entire box.
+        float boxDist = distBoxPoint(boxes[b], pi);
+        if (boxDist > reject || boxDist > best[2])
+            continue;
+
+        // Scan points in this box
+        const int boxStart = b * BOX_SIZE;
+        const int boxEnd   = min(n, (b + 1) * BOX_SIZE);
+        for (int t = boxStart; t < boxEnd; t++) {
+            if (t == s) continue;
+            const uint32_t j = sortedIndices[t];
+            const float3 pj = points[j];
+            const float dx = pi.x - pj.x;
+            const float dy = pi.y - pj.y;
+            const float dz = pi.z - pj.z;
+            float dist2 = dx*dx + dy*dy + dz*dz;
+            for (int k = 0; k < 3; k++) {
+                if (dist2 < best[k]) {
+                    float tmp = best[k];
+                    best[k] = dist2;
+                    dist2 = tmp;
+                }
+            }
+        }
+    }
+
+    outMeanDist2[i] = (best[0] + best[1] + best[2]) / 3.0f;
+}
 
 
 

@@ -29,6 +29,7 @@
 #include <thrust/sort.h>
 
 #include "knn_cpu.h"
+#include "knn_boxes.cuh"
 
 #define CUDA_CHECK(call) do {                                       \
     cudaError_t err__ = (call);                                     \
@@ -202,6 +203,30 @@ static void compute_bbox_cpu(const std::vector<float3>&pts, float3& outMin, floa
     if ((outMax.z - outMin.z) < eps) outMax.z = outMin.z + eps;
 }
 
+static void report(const char* name, int n,
+                   const std::vector<float>& ref, const std::vector<float>& got)
+{
+    float maxAbsErr = 0.0f;
+    int   maxIdx = -1;
+    int   exactMatch = 0;
+
+    for (int i = 0; i < n; i++) {
+        float err = std::fabs(got[i] - ref[i]);
+        if (err < 1e-9f) exactMatch++;
+        if (err > maxAbsErr) { maxAbsErr = err; maxIdx = i; }
+    }
+
+    std::printf("=== %s ===\n", name);
+    std::printf("  N=%d  exactMatches=%d/%d  maxAbsErr=%.9g", n, exactMatch, n, maxAbsErr);
+    if (maxIdx >= 0)
+        std::printf(" (at i=%d: ref=%.9g got=%.9g)", maxIdx, ref[maxIdx], got[maxIdx]);
+    std::printf("\n");
+    for (int i = 0; i < 5; i++)
+        std::printf("  i=%d  ref=%.6f  got=%.6f\n", i, ref[i], got[i]);
+    std::printf("\n");
+}
+
+void knn3BoxPrunedKernel(int i, float3 * float3, thrust::detail::pointer_traits<thrust::device_ptr<unsigned>>::raw_pointer base, thrust::detail::pointer_traits<thrust::device_ptr<MinMax>>::raw_pointer min_max, int num_boxes, float * d_out_boxes);
 
 int main() {
     // Uncomment below for Step 0:
@@ -232,10 +257,10 @@ int main() {
     //3. Allocate GPU buffers
     float3* d_points = nullptr;
     float* d_out_exact = nullptr;
-    float* d_out_window = nullptr;
+    float* d_out_boxes = nullptr;
     CUDA_CHECK(cudaMalloc(&d_points, N*sizeof(float3)));
     CUDA_CHECK(cudaMalloc(&d_out_exact, N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_out_window, N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_out_boxes, N*sizeof(float)));
 
     //4. Copy from CPU to GPU
     CUDA_CHECK(cudaMemcpy(d_points, h_points.data(),
@@ -258,6 +283,30 @@ int main() {
     thrust::sequence(d_indices.begin(), d_indices.end());
     thrust::sort_by_key(d_codes.begin(),d_codes.end(), d_indices.begin());
 
+    //7. Build AABB
+    const int numBoxes = (N + BOX_SIZE - 1) / BOX_SIZE;
+    thrust::device_vector<MinMax> d_boxes(numBoxes);
+
+    boxMinMaxKernel<<<numBoxes, BOX_SIZE>>>(
+        N, d_points,
+        thrust::raw_pointer_cast(d_indices.data()),
+        thrust::raw_pointer_cast(d_boxes.data()));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // (Sanity check: print the box AABBs)
+    std::vector<MinMax> h_boxes(numBoxes);
+    CUDA_CHECK(cudaMemcpy(h_boxes.data(), thrust::raw_pointer_cast(d_boxes.data()),
+                          numBoxes * sizeof(MinMax), cudaMemcpyDeviceToHost));
+    std::printf("Built %d boxes (BOX_SIZE=%d):\n", numBoxes, BOX_SIZE);
+    for (int b = 0; b < numBoxes; b++) {
+        std::printf("  box %d: min=(%.3f,%.3f,%.3f) max=(%.3f,%.3f,%.3f)\n", b,
+                    h_boxes[b].minn.x, h_boxes[b].minn.y, h_boxes[b].minn.z,
+                    h_boxes[b].maxx.x, h_boxes[b].maxx.y, h_boxes[b].maxx.z);
+    }
+    std::printf("\n");
+
+
     // As a check print the first few indices
     const int printCount= std::min(10, N);
     std::vector<uint32_t> h_indices(printCount);
@@ -275,19 +324,36 @@ int main() {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     //7. Approx. Morton window KNN
-    knn3_mean_dist2_morton_window_gpu<8><<<grid,block>>>(
+    // knn3_mean_dist2_morton_window_gpu<8><<<grid,block>>>(
+    //     N, d_points,
+    //     thrust::raw_pointer_cast(d_indices.data()),
+    //     d_out_window);
+    // CUDA_CHECK(cudaGetLastError());
+    // CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 7Edited) Box-pruned GPU KNN
+    knn3BoxPrunedKernel<<<grid, block>>>(
         N, d_points,
         thrust::raw_pointer_cast(d_indices.data()),
-        d_out_window);
+        thrust::raw_pointer_cast(d_boxes.data()),
+        numBoxes,
+        d_out_boxes);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    //8. Copy from GPU to CPU and print
-    std::vector<float> h_gpu_exact(N), h_gpu_window(N);
-    CUDA_CHECK(cudaMemcpy(h_gpu_exact.data(), d_out_exact, N*sizeof(float),
-        cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_gpu_window.data(), d_out_window,
-            N*sizeof(float), cudaMemcpyDeviceToHost));
+    //7b. Copy from GPU to CPU and print
+    std::vector<float> h_brute(N), h_boxed(N);
+    CUDA_CHECK(cudaMemcpy(h_brute.data(), d_out_exact, N * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_boxed.data(), d_out_boxes, N * sizeof(float), cudaMemcpyDeviceToHost));
+
+    report("GPU brute-force vs CPU ref",    N, h_ref, h_brute);
+    report("GPU box-pruned  vs CPU ref",    N, h_ref, h_boxed);
+
+    // std::vector<float> h_gpu_exact(N), h_gpu_window(N);
+    // CUDA_CHECK(cudaMemcpy(h_gpu_exact.data(), d_out_exact, N*sizeof(float),
+    //     cudaMemcpyDeviceToHost));
+    // CUDA_CHECK(cudaMemcpy(h_gpu_window.data(), d_out_boxes,
+    //         N*sizeof(float), cudaMemcpyDeviceToHost));
 
     // std::printf("points[0] = (%.3f, %.3f, %.3f)\n",
     //         h_points[0].x, h_points[0].y, h_points[0].z);
@@ -298,34 +364,34 @@ int main() {
     // }
 
     // 9. Compare CPU result to GPU
-    auto report = [&](const char* name, const std::vector<float>& got) {
-
-        float maxAbsErr = 0.0f;
-        int maxIdx = -1;
-        for (int i =0; i<N; i++) {
-            float err = std::fabs(got[i] - h_ref[i]);
-            if (err > maxAbsErr) {
-                maxAbsErr = err;
-                maxIdx = i;
-            }
-        }
-        std::printf("%s vs CPU ref:\n", name);
-        std::printf("  maxAbsErr = %.9g at i=%d\n", maxAbsErr, maxIdx);
-        if (maxIdx >= 0) {
-            std::printf("  ref[%d]=%.9g  got[%d]=%.9g\n",
-                        maxIdx, h_ref[maxIdx], maxIdx, got[maxIdx]);
-        }
-        for (int i = 0; i < 5; i++) {
-            std::printf("  i=%d  ref=%.6f  got=%.6f\n", i, h_ref[i], got[i]);
-        }
-    };
-
-    report("GPU exact brute-force", h_gpu_exact);
-    report("GPU Morton-window (±8 in sorted order)", h_gpu_window);
+    // auto report = [&](const char* name, const std::vector<float>& got) {
+    //
+    //     float maxAbsErr = 0.0f;
+    //     int maxIdx = -1;
+    //     for (int i =0; i<N; i++) {
+    //         float err = std::fabs(got[i] - h_ref[i]);
+    //         if (err > maxAbsErr) {
+    //             maxAbsErr = err;
+    //             maxIdx = i;
+    //         }
+    //     }
+    //     std::printf("%s vs CPU ref:\n", name);
+    //     std::printf("  maxAbsErr = %.9g at i=%d\n", maxAbsErr, maxIdx);
+    //     if (maxIdx >= 0) {
+    //         std::printf("  ref[%d]=%.9g  got[%d]=%.9g\n",
+    //                     maxIdx, h_ref[maxIdx], maxIdx, got[maxIdx]);
+    //     }
+    //     for (int i = 0; i < 5; i++) {
+    //         std::printf("  i=%d  ref=%.6f  got=%.6f\n", i, h_ref[i], got[i]);
+    //     }
+    // };
+    //
+    // report("GPU exact brute-force", h_gpu_exact);
+    // report("GPU Morton-window (±8 in sorted order)", h_gpu_window);
 
     //10. Cleanup
     CUDA_CHECK(cudaFree(d_points));
-    CUDA_CHECK(cudaFree(d_out_window));
+    CUDA_CHECK(cudaFree(d_out_boxes));
     CUDA_CHECK(cudaFree(d_out_exact));
 
     return 0;
