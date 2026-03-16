@@ -12,7 +12,8 @@ add_executable(simple_knn_cuda
         main.cu
         knn_cpu.cpp
         knn_cpu.h
-        knn_boxes.cuh)
+        knn_boxes.cuh
+        simple_knn.cu)
 
 target_include_directories(simple_knn_cuda PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
