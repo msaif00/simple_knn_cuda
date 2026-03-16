@@ -226,7 +226,9 @@ static void report(const char* name, int n,
     std::printf("\n");
 }
 
-void knn3BoxPrunedKernel(int i, float3 * float3, thrust::detail::pointer_traits<thrust::device_ptr<unsigned>>::raw_pointer base, thrust::detail::pointer_traits<thrust::device_ptr<MinMax>>::raw_pointer min_max, int num_boxes, float * d_out_boxes);
+void knn3BoxPrunedKernel(int i, float3 * float3,
+    thrust::detail::pointer_traits<thrust::device_ptr<unsigned>>::raw_pointer base,
+    thrust::detail::pointer_traits<thrust::device_ptr<MinMax>>::raw_pointer min_max, int num_boxes, float * d_out_boxes);
 
 int main() {
     // Uncomment below for Step 0:

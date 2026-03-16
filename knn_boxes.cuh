@@ -79,7 +79,7 @@ __global__ void boxMinMaxKernel(
 // scan the box's points
 // Launch config: <<<(N+255)/256, 256>>> (one thread per point in sorted order.
 
-__global__ void knn3BoxPrunedKernl(
+__global__ void knn3BoxPrunedKernel(
     int n,
     const float3* __restrict__ points,
     const uint32_t* __restrict__ sortedIndices,
